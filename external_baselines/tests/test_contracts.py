@@ -11,13 +11,39 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from camera import convert_poses
-from study import fingerprint, resume_valid, sha, validate_video, logged
+from camera import convert_poses, nominal_calibration
+from study import fingerprint, resume_valid, sha, validate_video, logged, nominal_smoke
 from collect_metrics import quality, QUALITY
 from initial_image import read_initial_image
 
 
 class CameraTests(unittest.TestCase):
+    def test_nominal_intrinsics_follow_actual_anisotropic_resize(self):
+        record = nominal_calibration(1920, 1080)
+        fx, fy, cx, cy = record['normalized_intrinsics_after_resize']
+        self.assertAlmostEqual(fx, 1.01011919, places=7)
+        self.assertAlmostEqual(fy, fx * 1920/1080)
+        self.assertEqual((cx, cy), (.5, .5))
+        self.assertFalse(record['verified'])
+        native = np.array(record['native_K'])
+        target = np.array(record['resized_K'])
+        transform = np.array(record['pixel_transform'])
+        point = np.array([100.5, 70.5, 1.])
+        np.testing.assert_allclose(np.linalg.inv(native) @ point,
+                                   np.linalg.inv(target) @ (transform @ point))
+        # Full-image resize preserves normalized K, not equal x/y pixel focal lengths.
+        self.assertNotEqual(target[0, 0], target[1, 1])
+
+    def test_nominal_calibration_requires_explicit_smoke_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'poses.json'
+            path.write_text(json.dumps({'CineCameraActor': {'0': {
+                'position': [0, 0, 0], 'rotation': [0, 0, 0]}}}))
+            calibration = nominal_calibration(640, 352)
+            with self.assertRaises(ValueError):
+                convert_poses(path, 0, 1, calibration)
+            self.assertEqual(convert_poses(path, 0, 1, calibration, allow_nominal=True).shape, (1, 16))
+
     def test_known_translation_rotation_and_no_images(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'poses.json'
@@ -41,6 +67,36 @@ class CameraTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
+    def test_nominal_smoke_needs_no_evaluator_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'data'
+            source.mkdir()
+            initial = source/'0000.png'
+            Image.new('RGB', (640, 352)).save(initial)
+            pose = source/'poses.json'
+            pose.write_text(json.dumps({'CineCameraActor': {str(k): {
+                'position': [k, 0, 0], 'rotation': [0, 0, 0]} for k in range(65)}}))
+            rows = [dict(scene='scene', start_frame=0, num_frames=5397, fps=30, duration_sec=180,
+                         input_image=str(initial), pose_path=str(pose), gt_frames_dir=str(source),
+                         prompt='', output_prefix=f'{i}_', split_id='seed0', split_seed=0) for i in range(15)]
+            manifest = root/'manifest.jsonl'
+            manifest.write_text('\n'.join(json.dumps(r) for r in rows))
+            checkpoint = root/'model.ckpt'
+            checkpoint.write_bytes(b'fake; generation mocked')
+            output = root/'nominal'
+            output.mkdir()
+            cfg = dict(source_manifest=str(manifest), source_dataset_root=str(source), dataset_root=str(source),
+                       smoke_frames=65, seed=42, dfot_python=sys.executable, dfot_checkpoint=str(checkpoint),
+                       checkpoint_provenance='test', dfot_repo='/mock', minimum_free_gib=0)
+            with patch('study.capture', return_value='mock environment'), patch('study.code_identity', return_value={}), \
+                 patch('study.shutil.which', return_value='/mock'), patch('study.generate', return_value={'frames': 65}) as generate, \
+                 patch('builtins.print'):
+                nominal_smoke(cfg, output, '0')
+            self.assertTrue(generate.call_args.kwargs['smoke'])
+            self.assertFalse(json.loads((output/'result.json').read_text())['eligible_for_full_run_or_metrics'])
+            self.assertFalse((output/'smoke/estimate.json').exists())
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe unavailable')
     def test_real_encoded_video_validation(self):
         with tempfile.TemporaryDirectory() as directory:

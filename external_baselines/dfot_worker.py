@@ -76,7 +76,8 @@ def main():
     loaded = time.monotonic()
     # The only image opened by generation is the initial observed image.
     initial = torch.from_numpy(read_initial_image(row['input_image'])).permute(2, 0, 1).float() / 255
-    poses = convert_poses(Path(row['pose_path']), row['start_frame'], count, job['calibration'])
+    poses = convert_poses(Path(row['pose_path']), row['start_frame'], count, job['calibration'],
+                          allow_nominal=job.get('allow_nominal_calibration', False))
     np.save(job['camera_path'], poses)
     conditions = torch.from_numpy(poses)[None].to('cuda')
     torch.cuda.reset_peak_memory_stats()
@@ -115,6 +116,7 @@ def main():
         gpu=torch.cuda.get_device_name(), torch_version=torch.__version__,
         dtype='float32', initial_observed_frames=1, prompt_supported=False,
         camera_conditioned=True, retrieval_latency=None,
+        calibration_status=job['calibration'].get('status', 'verified'),
         context_representation='upstream sliding RGB tensor + generated keyframe interpolation',
         output_buffer_note='full prediction tensor retained by upstream; not a retrieval archive')
     Path(job['resources']).write_text(json.dumps(metrics, indent=2) + '\n')

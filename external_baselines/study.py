@@ -279,6 +279,7 @@ def generate(cfg, row, index, count, run_id, calibration, root, gpu, smoke=False
                checkpoint=cfg['dfot_checkpoint'], calibration=calibration[row['scene']],
                output=str(attempt / 'partial.mp4'), resolved_config=str(attempt / 'resolved.yaml'),
                camera_path=str(attempt / 'camera.npy'), resources=str(attempt / 'resources.json'))
+    job['allow_nominal_calibration'] = smoke and calibration[row['scene']].get('status') == 'nominal_paper_smoke_only'
     save(attempt / 'job.json', job)
     began = time.monotonic()
     logged([cfg['dfot_python'], '-u', HERE / 'dfot_worker.py', '--job', attempt / 'job.json'],
@@ -388,9 +389,60 @@ def export(root, rows, coverage, scores):
     (tables / 'comparison.tex').write_text('\n'.join(lines) + '\n')
 
 
+def nominal_smoke(cfg, root, gpu):
+    """Independent engineering smoke; requires no metric configs or GT image reads."""
+    from PIL import Image
+    from camera import nominal_calibration, convert_poses
+    rows, _ = prepare(cfg, root)
+    count = cfg['smoke_frames']
+    if type(count) is not int or not 32 <= count <= 200:
+        raise ValueError('Nominal smoke is limited to 32–200 frames of the first trajectory')
+    if type(cfg['seed']) is not int or not 0 <= cfg['seed'] < 2**32:
+        raise ValueError('Invalid generation seed')
+    if ',' in str(gpu) or not str(gpu).strip():
+        raise ValueError('Assign exactly one GPU')
+    python = Path(cfg['dfot_python'])
+    if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError('Set dfot_python to the existing absolute interpreter')
+    checkpoint = Path(cfg['dfot_checkpoint'])
+    if not checkpoint.is_file() or checkpoint.stat().st_size == 0 or '.no_exist' in checkpoint.parts:
+        raise ValueError('Download the real pretrained_models/DFoT_RE10K.ckpt and set dfot_checkpoint first')
+    if not cfg.get('checkpoint_provenance') or 'REPLACE' in cfg['checkpoint_provenance']:
+        raise ValueError('Record checkpoint source and revision')
+    for binary in ('ffmpeg', 'ffprobe', 'nvidia-smi'):
+        if not shutil.which(binary):
+            raise ValueError(f'Missing executable: {binary}')
+    if shutil.disk_usage(root).free < cfg['minimum_free_gib'] * 1024**3:
+        raise ValueError('Insufficient free disk space')
+    row = rows[0]
+    with Image.open(row['input_image']) as image:
+        calibration = nominal_calibration(*image.size)
+        image.verify()
+    poses = convert_poses(Path(row['pose_path']), row['start_frame'], count, calibration, allow_nominal=True)
+    save(root / 'inputs' / 'nominal_calibration.json', {row['scene']: calibration})
+    save(root / 'inputs' / 'camera_preview.json', {'first': poses[0].tolist(), 'last': poses[-1].tolist()})
+    provenance = dict(status='nominal_paper_smoke_only', calibration=calibration,
+        manifest=load(root/'inputs/manifest.identity.json'), frames=count, seed=cfg['seed'],
+        checkpoint_sha256=sha(checkpoint), checkpoint_provenance=cfg['checkpoint_provenance'],
+        dfot_code=code_identity(cfg['dfot_repo']),
+        adapter_sha256=fingerprint({p.name: sha(p) for p in sorted(HERE.glob('*.py'))}),
+        environment=capture([python, '-m', 'pip', 'freeze']))
+    run_id = fingerprint(provenance)
+    old = root / 'provenance.json'
+    if old.exists() and load(old)['compatibility_sha256'] != run_id:
+        raise ValueError('Nominal smoke settings changed; preserve this run and choose a new study_root')
+    save(old, dict(provenance, compatibility_sha256=run_id, hardware=capture(['nvidia-smi'])))
+    print('NOMINAL SMOKE ONLY: 52.67-degree horizontal FOV assumed; calibration is not verified', flush=True)
+    print(json.dumps(calibration, indent=2), flush=True)
+    receipt = generate(cfg, row, 0, count, run_id, {row['scene']: calibration}, root, gpu, smoke=True)
+    save(root / 'result.json', {'status': 'nominal_smoke_complete', 'receipt': receipt,
+                              'eligible_for_full_run_or_metrics': False})
+    print(f'Nominal smoke complete: {root / "smoke"}; inspect video, calibration, and frame map', flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('stage', choices=['audit', 'smoke', 'run'])
+    p.add_argument('stage', choices=['audit', 'nominal-smoke', 'smoke', 'run'])
     p.add_argument('--config', type=Path, required=True)
     p.add_argument('--gpu', default='0')
     p.add_argument('--approved-hours', type=float)
@@ -398,6 +450,8 @@ def main():
     args = p.parse_args()
     cfg = load(args.config)
     root = Path(cfg['study_root']).resolve()
+    if args.stage == 'nominal-smoke':
+        root = root / 'nominal_smoke'
     root.mkdir(parents=True, exist_ok=True)
     (root / 'logs').mkdir(exist_ok=True)
     rows, coverage, scores = [], [], []
@@ -407,6 +461,9 @@ def main():
         try:
             if args.stage == 'audit':
                 audit(cfg, root)
+                return 0
+            if args.stage == 'nominal-smoke':
+                nominal_smoke(cfg, root, args.gpu)
                 return 0
             rows, manifest = prepare(cfg, root)
             coverage = [dict(model=RUN, row=i, scene=r['scene'], status='pending', frames=0,
@@ -496,7 +553,7 @@ def main():
                 if item['status'] == 'pending':
                     item.update(status='blocked', error=str(exc))
         finally:
-            if args.stage != 'audit':
+            if args.stage not in ('audit', 'nominal-smoke'):
                 if not scores:
                     scores.append(dict(model=RUN, checkpoint=cfg.get('checkpoint_provenance', ''),
                         camera_input=True, initial_observed_frames=1, nominal_duration=180,
