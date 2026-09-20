@@ -95,7 +95,8 @@ def audit(cfg, root):
     report['checkpoint_candidates'] = []
     for directory in cfg.get('checkpoint_search_roots', []):
         for p in Path(directory).rglob('*'):
-            if p.is_file() and p.suffix in ('.ckpt', '.safetensors'):
+            if (p.is_file() and p.suffix in ('.ckpt', '.safetensors')
+                    and '.no_exist' not in p.parts and p.stat().st_size > 0):
                 report['checkpoint_candidates'].append({'path': str(p), 'bytes': p.stat().st_size})
     try:
         rows = [json.loads(line) for line in Path(cfg['source_manifest']).read_text().splitlines() if line.strip()]

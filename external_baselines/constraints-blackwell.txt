@@ -1,0 +1,5 @@
+# Initial compatibility constraints, not a fully validated environment lock.
+# Install Torch/TorchVision from the official cu128 index before requirements.
+numpy==1.26.4
+torch==2.7.1
+torchvision==0.22.1

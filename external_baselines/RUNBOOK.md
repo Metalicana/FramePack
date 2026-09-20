@@ -19,12 +19,55 @@ RE10K EMA weights; these are trained on RealEstate10K, not the shared CaM baseli
 
 ## 1. Pull, configure, and audit
 
+Create the separate DFoT environment first, on the cluster:
+
+```bash
+conda create -n dfot -c conda-forge python=3.10 pip numpy=1.26 pillow ffmpeg -y
+conda activate dfot
+export STUDY_PYTHON="$CONDA_PREFIX/bin/python"
+```
+
+This follows the checked-out DFoT README's Python 3.10 choice and its NumPy 1.x
+requirement. It installs the prerequisites for the inventory and CPU tests;
+it is not yet the complete inference environment. Run the audit before choosing
+the CUDA-enabled PyTorch build, so that choice can match the installed NVIDIA
+driver. The upstream dependency file leaves Torch and many other versions
+unpinned; do not treat a fresh unconstrained install as a tested environment.
+Keep the existing `memcam` and `vbench` environments separate.
+
+The supplied CECSL audit reports two RTX PRO 6000 Blackwell GPUs (97,887 MiB each),
+driver 610.57.04, and environments under `/home/ab575577/miniconda3/envs/`.
+Update all three configured Python paths accordingly. The dataset and 15-row
+manifest exist; source manifest SHA256 is
+`f0676a252e4d528e8ee7b512bd2bb9bf3090ebc32f3e67ef9b5b6ac9073130a8`.
+The sampled pose has position/rotation/scale only, so it does not establish
+intrinsics. No DFoT checkpoint was reported in the searched roots; also check
+the DFoT repository's `huggingface/` directory, which its downloader uses.
+
+For this Blackwell machine, begin with the official CUDA 12.8 Torch wheel pair:
+
+```bash
+conda activate dfot
+python -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -c "$HOME/FramePack/external_baselines/constraints-blackwell.txt" -r "$HOME/diffusion-forcing-transformer/requirements.txt"
+python -m pip check
+```
+
+PyTorch 2.7 introduced Blackwell/CUDA 12.8 support:
+https://pytorch.org/blog/pytorch-2-7/ . The paired 2.7.1/0.22.1 installation is
+listed at https://pytorch.org/get-started/previous-versions/ . These constraints
+prevent downstream requirements from replacing the selected Torch pair or NumPy
+1.x; they are not a tested complete dependency lock. Check actual CUDA execution
+and DFoT imports before considering installation successful. Cluster DFoT revision
+`0fac21e2df8636dfa1dd47bf74572c5ad80778fe` differs from the locally inspected
+revision, so compatibility must be established by the import/model smoke checks.
+
 From the cluster FramePack checkout:
 
 ```bash
 cp external_baselines/config.example.json /tmp/external-baselines.json
 # Edit /tmp/external-baselines.json to match your actual paths.
-export STUDY_PYTHON=/absolute/path/to/python
+export STUDY_PYTHON="$CONDA_PREFIX/bin/python"
 bash external_baselines/run.sh audit --config /tmp/external-baselines.json
 ```
 
