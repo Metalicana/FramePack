@@ -1,0 +1,245 @@
+# External baseline comparison: local code, user-run cluster jobs
+
+All new code is in `FramePack/external_baselines/`. Push this directory with the
+FramePack repository, then pull it on the cluster. Nothing here uses SSH, submits
+Slurm jobs, trains models, downloads model weights, or regenerates MemCam videos.
+Use CECSL directly inside your own tmux session. On Newton, run inside an allocation
+you obtain under the site's actual rules; no allocation details have been assumed.
+
+**Status:** implemented locally, with CPU contract tests. No checkpoint load,
+GPU smoke, generated comparison video, or metric run has been validated here.
+The first cluster action is the audit below. Paths in the example are placeholders
+or previously recorded locations, not confirmed cluster inventory.
+
+Stock FramePack is excluded at your request. Both inspected workers (original and
+F1) accept an image and text, but no numeric camera trajectory. A camera-conditioned
+extension with compatible trained weights needs a separate adapter audit before
+it can be included. This implementation supports only official pixel-space DFoT
+RE10K EMA weights; these are trained on RealEstate10K, not the shared CaM baseline.
+
+## 1. Pull, configure, and audit
+
+From the cluster FramePack checkout:
+
+```bash
+cp external_baselines/config.example.json /tmp/external-baselines.json
+# Edit /tmp/external-baselines.json to match your actual paths.
+export STUDY_PYTHON=/absolute/path/to/python
+bash external_baselines/run.sh audit --config /tmp/external-baselines.json
+```
+
+The audit needs standard Python only. Subsequent stages need NumPy and Pillow in
+`STUDY_PYTHON`. Choose an existing absolute interpreter; the launcher does not
+activate environments. Generation uses `dfot_python`; quality uses `metric_python`;
+standard VBench uses `vbench_python`. Keep the DFoT environment separate from the
+working MemCam/VBench environments. Use the checked-out DFoT README/requirements
+when preparing that environment. No package installations are done by this code.
+
+Audit writes `STUDY/audit.json`: hostname, GPUs, disk, environments, repository
+commits/source hashes, configured path existence, and checkpoint candidates within
+the explicitly configured search roots. Candidate filenames do not establish
+checkpoint provenance. Record the verified source/revision in
+`checkpoint_provenance`; the launcher hashes the checkpoint itself. It fails if
+the checkpoint is not a released EMA checkpoint or its model keys are incompatible.
+Only load a checkpoint whose source you trust: upstream Lightning checkpoints use
+Python pickle via `torch.load`.
+
+Use the original 15-row `context_memory_180s/manifest.jsonl`. If it is only on
+Newton, transfer that exact file yourself and set `source_manifest` to the copied
+file. `source_dataset_root` is the prefix actually present in its path fields;
+`dataset_root` is the destination dataset prefix. The launcher preserves original
+bytes, all non-path fields, relative file identities, and row order. It never
+rebuilds the split. Required values are 30 FPS, 5,397 frames, nominal 180 seconds.
+The effective encoded duration is 179.9 seconds; the last timestamp is 5396/30.
+
+## 2. Camera metadata is required before smoke
+
+Set `calibration_file` to a JSON object keyed by the exact manifest scene names.
+Each scene needs the following record. **This example is intentionally unverified;
+do not turn verification on until the source camera convention and intrinsics
+have been checked.**
+
+```json
+{
+  "EXACT_SCENE_NAME": {
+    "verified": false,
+    "evidence": "Record camera export metadata/FOV, image dimensions, axis and known-motion checks here",
+    "position_units_per_meter": 100,
+    "opencv_camera_to_ue_camera": [[0, 0, 1], [1, 0, 0], [0, -1, 0]],
+    "normalized_intrinsics_after_resize": [0.0, 0.0, 0.5, 0.5]
+  }
+}
+```
+
+The matrix shown maps OpenCV right/down/forward camera axes into UE
+forward/right/up axes. It is a candidate convention, not verified dataset metadata.
+The code matches MemCam's `Rz(yaw) @ Ry(pitch) @ Rx(roll)` and centimeter-to-meter
+conversion, changes world and camera bases together, then inverts to w2c. DFoT
+receives `[fx, fy, cx, cy, flattened_w2c_3x4]`, and its upstream code performs
+reference-camera normalization. Intrinsics must be normalized to image width and
+height. Full-image resizing preserves these normalized values; there is no crop.
+Do not guess focal lengths from another dataset. If focal length varies across a
+trajectory, this constant-per-scene adapter must be extended before running.
+
+The preflight checks all requested pose indices and writes first/second/last
+converted poses to `inputs/camera_preview_*.json`. It requires consecutive dataset
+frame keys, rather than silently treating sparse keys as consecutive frames.
+Known translation and yaw tests verify the conversion math, but do not establish
+that the real dataset's export convention matches the candidate basis.
+
+## 3. Freeze the actual evaluation configuration
+
+Set `quality_reference_summary` to an existing 180-second source result's
+`summary.json`. The launcher requires stride-30, 224-pixel LPIPS and StyleGAN-V I3D
+FVD with 16-frame clips, four clips/video, stride four, 224 pixels, epsilon 1e-6.
+Set `fvd_detector` and `fvd_detector_sha256` from that source run's actual detector.
+Use `sha256sum /path/to/detector` on Linux. Quality downloads are disabled.
+
+`vbench_reference_config` is a JSON record transcribed from the actual saved
+standard VBench invocation and weights, with these fields:
+
+```json
+{
+  "source_evidence": "/absolute/path/to/source/invocation-or-config",
+  "mode": "custom_input",
+  "dimensions": ["subject_consistency", "background_consistency", "motion_smoothness", "dynamic_degree", "aesthetic_quality", "imaging_quality"],
+  "imaging_quality_preprocessing_mode": "longer",
+  "checkpoint_sha256": {
+    "/absolute/path/to/each/local/metric/checkpoint": "actual_sha256"
+  }
+}
+```
+
+Include all weights actually used, not one representative detector. The launcher
+verifies these hashes and calls VBench with local checkpoints enabled. Verify its
+cache lookup matches those paths. Set `vbench_imaging_preprocessing` to the same
+saved setting. The launcher copies the reference records into `inputs/` and
+fingerprints the code and environments. A record of defaults alone is not evidence
+of what generated the earlier results.
+
+DFoT uses a full-image bicubic resize to 256×256 and float32 inference. It ignores
+text because this checkpoint has no prompt interface. Native DFoT files are kept
+untouched. Output index k is GT `start_frame+k`; there is no FPS relabeling, repeated
+output padding, or future-GT interpolation. The first output is the resized
+initial image. The other observations used for continuation are generated.
+
+The MemCam evaluator resizes GT to each generator's native frame size before
+LPIPS's 224-pixel preprocessing. Consequently DFoT and MemCam have different native
+resolution paths even with the same evaluator flags. Review and disclose this
+when approving the protocol; if you require a single identical spatial resampling
+path, implement that evaluator change and reevaluate existing MemCam videos under
+it before combining scores. Do not copy historical numbers under a changed protocol.
+
+## 4. Smoke, inspect, then approve the full run
+
+```bash
+export STUDY_PYTHON=/absolute/path/to/python-with-numpy-and-pillow
+bash external_baselines/run.sh smoke --config /tmp/external-baselines.json --gpu 0
+```
+
+This runs the first trajectory for 65 frames by default, in `STUDY/smoke/`, and
+never marks it as a completed study video. Inspect its video, converted poses,
+`frame_map.csv`, `resolved.yaml`, logs, and `smoke/estimate.json`. Preflight checks
+all initial images and all GT filenames; generation only opens the initial image
+and pose JSON. Future GT images are read only by evaluation.
+
+Inference calls upstream `_predict_videos`, with keyframe density 0.0625,
+stabilized-vanilla prediction guidance 4.0/stabilization 0.02, vanilla interpolation
+guidance 1.5, and interpolation batch size four. Sampling steps and remaining
+settings are recorded in `resolved.yaml`. Compilation is disabled. A narrow
+override pads only a short final camera-conditioning window using upstream's
+`_pad_to_max_tokens`; those masked slots do not create output frames.
+
+**Full-length GPU memory is not established by a short smoke.** Upstream retains
+full prediction tensors and constructs interpolation buffers; its memory usage
+grows with length. The linear time estimate is approximate and excludes metrics.
+If the first full-length video fails for memory, keep its log and adjust the
+implementation/configuration in a new study directory; do not silently split the
+trajectory into GT-initialized chunks.
+
+After inspecting smoke and confirming available GPU time, one command handles
+missing generation, validation, quality metrics, VBench, and exports:
+
+```bash
+bash external_baselines/run.sh run \
+  --config /tmp/external-baselines.json --gpu 0 \
+  --protocol-approved --approved-hours 24
+```
+
+Replace 24 with your actual approved budget, allowing time for metrics. This is
+an admission/between-stage budget check, not a hard process-kill timer: a running
+video or metric stage can finish beyond it. Use allocation limits for a hard wall
+time. Generation and metrics run sequentially on the explicitly selected GPU.
+The script does not launch workers on other GPUs. Reissue the same command to
+resume; it validates code/config/environment/input/checkpoint hashes, the video
+hash, full decoding, exact frame count, resolution and frame timestamps. Changed
+inputs or settings require a separate study root. Filename existence is insufficient.
+
+Successful outputs are atomically renamed from per-attempt directories. Failed
+attempts and metric directories are retained. A crash between the video rename
+and receipt write leaves an untrusted video: move it aside for inspection before
+retrying. The launcher will not silently overwrite it. A nonzero exit indicates
+requested work is incomplete; `failure.json` and `tables/coverage.csv` explain why.
+
+## 5. Existing MemCam results and optional VBench-Long
+
+Add verified source rows to `existing_results` before smoke/provenance freezing:
+
+```json
+{
+  "run": "ACTUAL_OUTPUT_DIRECTORY_NAME",
+  "manifest": "/absolute/path/to/canonical/manifest.jsonl",
+  "dataset_root": "/prefix/used/in/that/manifest",
+  "quality_dir": "/absolute/path/to/180s/quality/results",
+  "vbench_dir": "/absolute/path/to/180s/standard/vbench/results",
+  "checkpoint": "verified MemCam checkpoint/revision"
+}
+```
+
+The collector checks path-independent manifest identity, every quality record's
+scene/start/count/status, one complete 60-clip cohort FVD, quality parameters, and
+all 15 identities in each VBench dimension. It reuses MemCam's `validate_bench`,
+including imaging-quality scaling exactly once. Source artifacts are hashed into
+`inputs/source_RUN.json`. Verify saved generation configs for seed, checkpoint,
+resolution, and initial observations yourself before registering these historical
+rows: those differing config formats are not automatically parsed. Historical
+headlines are never used as fallback values. An empty `existing_results` generates
+only the DFoT score row and is not yet the complete MemCam comparison.
+
+Optionally add `vbench_long_command` as an argv array beginning with an absolute
+Python executable and your existing validated wrapper invocation, using its saved
+configuration and this exact cohort. It runs after standard metrics, logs to
+`logs/vbench_long.log`, and remains a separate result family. The wrapper must
+validate its own outputs; its zero-exit receipt is not standard VBench validation.
+No CUT3R calibration or 60-second suite is launched.
+
+## 6. Files produced and local checks
+
+Under the configured study root:
+
+- `inputs/`: original/remapped manifests, hashes, reference configs, camera previews.
+- `provenance.json`: checkpoint, code/environment fingerprints, hardware and protocol.
+- `smoke/`: short output and cost estimate, separate from the real cohort.
+- `dfot_re10k/`: 15 final `output_prefix + custom.mp4` files and receipts; attempt
+  subdirectories hold resolved settings, cameras, index maps, resources and logs.
+- `metrics/`: quality, exact-cohort standard VBench inputs/results, collected scores.
+- `logs/`: import checks, evaluators, collection, and optional long-evaluator log.
+- `tables/coverage.csv`, `tables/scores.csv`, `tables/comparison.tex`: unavailable
+  scores remain blank; FramePack exclusion appears in coverage. VBench is [0,1].
+
+Resource columns distinguish startup/checkpoint loading, synchronized generation,
+and video encoding/transfer time. Peak CUDA allocated/reserved bytes and peak
+process RSS are separate. Retrieval latency is N/A. These timings must not be
+compared to MemCam's retrieval-only CPU microbenchmark as generation speed.
+
+Run local tests from the FramePack checkout:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s external_baselines/tests -v
+```
+
+Local source audit: FramePack `97fe5dbe06ac1f337ece08935b1076a35eefeeb9`,
+DFoT `530f8bf4db91a21964993f214fa4050dbd529591`,
+MemCam `035efc375b35a7db8499fbdcedf4541f57b473a2`.
+No canonical dataset/manifest or matching checkpoints were found locally. The
+cluster audit and smoke are required to establish compatibility and feasibility.
