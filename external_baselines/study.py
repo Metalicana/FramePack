@@ -280,6 +280,7 @@ def generate(cfg, row, index, count, run_id, calibration, root, gpu, smoke=False
                output=str(attempt / 'partial.mp4'), resolved_config=str(attempt / 'resolved.yaml'),
                camera_path=str(attempt / 'camera.npy'), resources=str(attempt / 'resources.json'))
     job['allow_nominal_calibration'] = smoke and calibration[row['scene']].get('status') == 'nominal_paper_smoke_only'
+    job['precision'] = cfg.get('smoke_precision', 'float32') if smoke else 'float32'
     save(attempt / 'job.json', job)
     began = time.monotonic()
     logged([cfg['dfot_python'], '-u', HERE / 'dfot_worker.py', '--job', attempt / 'job.json'],
@@ -416,12 +417,13 @@ def nominal_smoke(cfg, root, gpu):
         raise ValueError('Insufficient free disk space')
     row = rows[0]
     with Image.open(row['input_image']) as image:
-        calibration = nominal_calibration(*image.size)
+        calibration = nominal_calibration(*image.size, spatial_mode=cfg.get('smoke_spatial', 'stretch'))
         image.verify()
     poses = convert_poses(Path(row['pose_path']), row['start_frame'], count, calibration, allow_nominal=True)
     save(root / 'inputs' / 'nominal_calibration.json', {row['scene']: calibration})
     save(root / 'inputs' / 'camera_preview.json', {'first': poses[0].tolist(), 'last': poses[-1].tolist()})
     provenance = dict(status='nominal_paper_smoke_only', calibration=calibration,
+        network_autocast=cfg.get('smoke_precision', 'float32'),
         manifest=load(root/'inputs/manifest.identity.json'), frames=count, seed=cfg['seed'],
         checkpoint_sha256=sha(checkpoint), checkpoint_provenance=cfg['checkpoint_provenance'],
         dfot_code=code_identity(cfg['dfot_repo']),
@@ -435,7 +437,23 @@ def nominal_smoke(cfg, root, gpu):
     print('NOMINAL SMOKE ONLY: 52.67-degree horizontal FOV assumed; calibration is not verified', flush=True)
     print(json.dumps(calibration, indent=2), flush=True)
     receipt = generate(cfg, row, 0, count, run_id, {row['scene']: calibration}, root, gpu, smoke=True)
+    preview = None
+    if calibration['spatial_mode'] == 'letterbox':
+        video = root / 'smoke' / (row['output_prefix'] + 'custom.mp4')
+        preview = root / 'preview_640x352.mp4'
+        left, top, right, bottom = calibration['content_box']
+        if not preview.exists():
+            temporary = root / f'preview_{time.time_ns()}.mp4'
+            logged(['ffmpeg', '-v', 'error', '-n', '-i', video, '-vf',
+                f'crop={right-left}:{bottom-top}:{left}:{top},scale=640:352:flags=bicubic,setsar=1',
+                '-an', '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p', temporary],
+                root / 'logs' / 'preview.log', gpu)
+            temporary.replace(preview)
+        save(root / 'preview.json', {'path': str(preview), 'sha256': sha(preview),
+            'native_sha256': receipt['video_sha256'], 'content_box': calibration['content_box'],
+            'display_size': [640, 352], 'purpose': 'display only; unpad and upscale, not native 640x352 generation'})
     save(root / 'result.json', {'status': 'nominal_smoke_complete', 'receipt': receipt,
+                              'display_preview': str(preview) if preview else None,
                               'eligible_for_full_run_or_metrics': False})
     print(f'Nominal smoke complete: {root / "smoke"}; inspect video, calibration, and frame map', flush=True)
 
@@ -447,11 +465,14 @@ def main():
     p.add_argument('--gpu', default='0')
     p.add_argument('--approved-hours', type=float)
     p.add_argument('--protocol-approved', action='store_true')
+    p.add_argument('--smoke-spatial', choices=['stretch', 'letterbox'], default='stretch')
+    p.add_argument('--smoke-precision', choices=['float32', 'bf16'], default='float32')
     args = p.parse_args()
     cfg = load(args.config)
     root = Path(cfg['study_root']).resolve()
     if args.stage == 'nominal-smoke':
-        root = root / 'nominal_smoke'
+        cfg = dict(cfg, smoke_spatial=args.smoke_spatial, smoke_precision=args.smoke_precision)
+        root = root / f'nominal_smoke_{args.smoke_spatial}_{args.smoke_precision}'
     root.mkdir(parents=True, exist_ok=True)
     (root / 'logs').mkdir(exist_ok=True)
     rows, coverage, scores = [], [], []

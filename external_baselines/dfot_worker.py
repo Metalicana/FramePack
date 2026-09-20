@@ -75,7 +75,8 @@ def main():
     torch.cuda.synchronize()
     loaded = time.monotonic()
     # The only image opened by generation is the initial observed image.
-    initial = torch.from_numpy(read_initial_image(row['input_image'])).permute(2, 0, 1).float() / 255
+    initial = torch.from_numpy(read_initial_image(row['input_image'],
+        job['calibration'].get('spatial_mode', 'stretch'))).permute(2, 0, 1).float() / 255
     poses = convert_poses(Path(row['pose_path']), row['start_frame'], count, job['calibration'],
                           allow_nominal=job.get('allow_nominal_calibration', False))
     np.save(job['camera_path'], poses)
@@ -88,7 +89,15 @@ def main():
         # the first context frame and then generated keyframes/history.
         xs = torch.zeros((1, count, 3, 256, 256), device='cuda')
         xs[:, 0] = initial.to('cuda')
-        predicted = model._predict_videos(model._normalize_x(xs), conditions)
+        precision = job.get('precision', 'float32')
+        if precision not in ('float32', 'bf16'):
+            raise ValueError('Unsupported precision')
+        if precision == 'bf16' and not torch.cuda.is_bf16_supported():
+            raise ValueError('Selected GPU does not support BF16')
+        # Keep weights, sampling state, and camera math in float32. Autocast
+        # accelerates eligible network operations without changing step counts.
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=precision == 'bf16'):
+            predicted = model._predict_videos(model._normalize_x(xs), conditions)
         del xs
         torch.cuda.synchronize()
         generation_end = time.monotonic()
@@ -101,6 +110,8 @@ def main():
         try:
             for k in range(count):
                 frame = initial if k == 0 else model._unnormalize_x(predicted[:, k:k + 1])[0, 0].cpu()
+                if not torch.isfinite(frame).all():
+                    raise ValueError(f'Nonfinite generated pixels at frame {k}')
                 writer.stdin.write((frame.clamp(0, 1).permute(1, 2, 0).numpy() * 255).round().astype('uint8').tobytes())
         finally:
             writer.stdin.close()
@@ -114,7 +125,7 @@ def main():
         peak_cuda_reserved_bytes=peak_reserved,
         peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024),
         gpu=torch.cuda.get_device_name(), torch_version=torch.__version__,
-        dtype='float32', initial_observed_frames=1, prompt_supported=False,
+        dtype='float32', network_autocast=precision, initial_observed_frames=1, prompt_supported=False,
         camera_conditioned=True, retrieval_latency=None,
         calibration_status=job['calibration'].get('status', 'verified'),
         context_representation='upstream sliding RGB tensor + generated keyframe interpolation',

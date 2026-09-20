@@ -4,7 +4,7 @@ import math
 import numpy as np
 
 
-def nominal_calibration(width, height):
+def nominal_calibration(width, height, spatial_mode='stretch'):
     """Paper-based smoke intrinsics for our full-image 256-square resize.
 
     Coordinates are measured from image edges; pixel centers are i+0.5,
@@ -14,7 +14,9 @@ def nominal_calibration(width, height):
         raise ValueError('Image dimensions must be positive')
     focal = width / (2 * math.tan(math.radians(52.67) / 2))
     native = np.array([[focal, 0, width/2], [0, focal, height/2], [0, 0, 1.]])
-    transform = np.diag([256/width, 256/height, 1.])
+    from initial_image import spatial_layout
+    (rw, rh), (left, top) = spatial_layout(width, height, spatial_mode)
+    transform = np.array([[rw/width, 0, left], [0, rh/height, top], [0, 0, 1.]])
     resized = transform @ native
     return dict(verified=False, status='nominal_paper_smoke_only',
         evidence='https://arxiv.org/html/2506.03141v2#A2',
@@ -24,11 +26,13 @@ def nominal_calibration(width, height):
                      'UE forward/right/up axes and MemCam rotation convention', 'positions are centimeters'],
         native_image_size=[width, height], output_image_size=[256, 256],
         pixel_coordinates='image edges; pixel centers i+0.5',
-        preprocessing='Pillow bicubic full-image resize; no crop or padding',
+        spatial_mode=spatial_mode, content_box=[left, top, left+rw, top+rh],
+        preprocessing=f'Pillow bicubic {spatial_mode}; whole source image retained',
         native_K=native.tolist(), pixel_transform=transform.tolist(), resized_K=resized.tolist(),
         position_units_per_meter=100,
         opencv_camera_to_ue_camera=[[0, 0, 1], [1, 0, 0], [0, -1, 0]],
-        normalized_intrinsics_after_resize=[resized[0, 0]/256, resized[1, 1]/256, .5, .5])
+        normalized_intrinsics_after_resize=[resized[0, 0]/256, resized[1, 1]/256,
+                                            resized[0, 2]/256, resized[1, 2]/256])
 
 
 def convert_poses(path, start, count, calibration, *, allow_nominal=False):

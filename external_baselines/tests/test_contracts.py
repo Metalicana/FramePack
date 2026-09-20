@@ -14,10 +14,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from camera import convert_poses, nominal_calibration
 from study import fingerprint, resume_valid, sha, validate_video, logged, nominal_smoke
 from collect_metrics import quality, QUALITY
-from initial_image import read_initial_image
+from initial_image import read_initial_image, spatial_layout
 
 
 class CameraTests(unittest.TestCase):
+    def test_letterbox_intrinsics_and_content_have_same_transform(self):
+        record = nominal_calibration(640, 360, 'letterbox')
+        self.assertEqual(record['content_box'], [0, 56, 256, 200])
+        fx, fy, cx, cy = record['normalized_intrinsics_after_resize']
+        self.assertAlmostEqual(fx, fy)
+        self.assertEqual((cx, cy), (.5, .5))
+        np.testing.assert_allclose(np.array(record['resized_K']),
+                                   np.array(record['pixel_transform']) @ np.array(record['native_K']))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'initial.png'
+            Image.new('RGB', (640, 360), 'white').save(path)
+            result = read_initial_image(path, 'letterbox')
+            self.assertTrue((result[:56] == 0).all())
+            self.assertTrue((result[56:200] == 255).all())
+            self.assertTrue((result[200:] == 0).all())
+
+    def test_letterbox_portrait_and_odd_sizes(self):
+        for width, height in [(360, 640), (641, 359)]:
+            record = nominal_calibration(width, height, 'letterbox')
+            (rw, rh), (x, y) = spatial_layout(width, height, 'letterbox')
+            self.assertEqual(record['content_box'], [x, y, x+rw, y+rh])
+            point = np.array([width * .3, height * .7, 1.])
+            np.testing.assert_allclose(np.linalg.inv(record['native_K']) @ point,
+                np.linalg.inv(record['resized_K']) @ (np.array(record['pixel_transform']) @ point))
+
     def test_nominal_intrinsics_follow_actual_anisotropic_resize(self):
         record = nominal_calibration(1920, 1080)
         fx, fy, cx, cy = record['normalized_intrinsics_after_resize']

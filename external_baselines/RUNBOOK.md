@@ -1,5 +1,47 @@
 # External baseline comparison: local code, user-run cluster jobs
 
+**Current requested scope: 15 matched 60-second videos.** The full-study commands
+below still describe the original 180-second implementation; do not launch that
+stage. We are first repairing the engineering smoke, reusing its original first
+trajectory so the framing/precision change can be compared. Selecting the exact
+60-second cohort and updating the full launcher/evaluation remains subsequent work.
+
+## Revised smoke: preserve aspect ratio and benchmark BF16
+
+After pushing/pulling FramePack changes, run from the cluster FramePack checkout:
+
+```bash
+export STUDY_PYTHON="$CONDA_PREFIX/bin/python"
+bash external_baselines/run.sh nominal-smoke \
+  --config "$HOME/external-baselines.json" --gpu 0 \
+  --smoke-spatial letterbox --smoke-precision bf16
+```
+
+For the observed 640×360 source PNG, the initial image is resized isotropically to
+256×144 and placed at y=56 inside a 256×256 black canvas. The camera intrinsics
+use that exact scale and padding translation. It preserves all original framing
+and avoids the earlier square squeeze. This is an experimental letterboxed input
+to a square-trained checkpoint, not evidence of native rectangular support.
+The inspected U-ViT positional geometry and DFoT ray generation both assume a
+square image, so simply changing height/width would not be a supported fix.
+
+Outputs are isolated in `STUDY/nominal_smoke_letterbox_bf16/`. Native square videos
+remain under `smoke/`. `preview_640x352.mp4` removes only the padding region and
+resizes that content to MemCam's display dimensions. This preview is upscaled
+256×144 content, not native 640×352 generated detail, and is not eligible for
+metrics. The display resize mirrors MemCam's full-image 640×360-to-640×352 resize.
+
+BF16 autocast applies to eligible network operations; model weights, diffusion
+state and upstream camera processing stay float32. Sampling steps, guidance and
+seed are unchanged. Numerical outputs may change. Nonfinite output pixels fail
+the run rather than being encoded silently. The resources JSON records autocast
+precision and measured time/memory; speedup is not established until this runs on
+the cluster. Use `--smoke-precision float32` for a separate framing-only check;
+it writes to `nominal_smoke_letterbox_float32/`.
+
+The existing original smoke is preserved. No full rollout is launched by either
+command, and nominal calibration is not promoted to verified calibration.
+
 All new code is in `FramePack/external_baselines/`. Push this directory with the
 FramePack repository, then pull it on the cluster. Nothing here uses SSH, submits
 Slurm jobs, trains models, downloads model weights, or regenerates MemCam videos.
